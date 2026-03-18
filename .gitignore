@@ -1,0 +1,12 @@
+# 屏蔽自动生成的数据库和笔记（包含隐私）
+Architect_Terminal/
+
+# 屏蔽打包产生的临时文件
+build/
+dist/
+*.spec
+__pycache__/
+
+# 额外保险：屏蔽所有文本和镜像（防止你误放日记）
+*.md
+*.txt
