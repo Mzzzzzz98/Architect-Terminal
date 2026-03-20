@@ -2,12 +2,12 @@ import os
 import sys
 import json
 import ctypes
-import ctypes.wintypes
 import time
 import psutil
 import winreg
 import calendar
 import requests
+import windnd
 from datetime import datetime, timedelta
 import customtkinter as ctk
 import tkinter as tk
@@ -17,35 +17,6 @@ import glob
 import random
 from PIL import Image, ImageTk, ImageGrab
 import traceback
-
-try:
-    # optional dependency (pylance/pyright may not resolve in env)
-    from tkinterdnd2 import DND_FILES  # type: ignore
-    _TKDND_AVAILABLE = True
-except Exception:
-    DND_FILES = None
-    _TKDND_AVAILABLE = False
-
-def _bind_tkdnd_drop(widget: tk.Misc, on_files):
-    """用 tkinterdnd2 绑定文件拖拽；不可用则返回 False。"""
-    if not _TKDND_AVAILABLE:
-        return False
-    try:
-        widget.drop_target_register(DND_FILES)
-        def _on_drop(event):
-            try:
-                # event.data 可能是带 {} 的路径列表，用 Tk 的 splitlist 最稳
-                paths = [p.strip("{}") for p in widget.tk.splitlist(event.data)]
-                paths = [p for p in paths if p]
-                if paths and callable(on_files):
-                    on_files(paths)
-            except Exception:
-                pass
-        widget.dnd_bind("<<Drop>>", _on_drop)
-        return True
-    except Exception as e:
-        print(f"tkdnd bind failed: {e}")
-        return False
 
 # ==========================================
 # ⚙️ 全局配置与路径初始化 (V16.0 路径安全升级)
@@ -102,26 +73,9 @@ def load_sys_config():
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                cfg = json.load(f)
-                # 兼容旧版本：补齐缺失字段
-                if not isinstance(cfg, dict):
-                    cfg = {}
-                if "timers" not in cfg or not isinstance(cfg.get("timers"), dict):
-                    cfg["timers"] = {}
-                cfg["timers"].setdefault("study_break_sec", 2 * 3600)  # 默认：2小时
-                cfg["timers"].setdefault("game_limit_sec", int(2.5 * 3600))  # 默认：2.5小时
-                return cfg
+                return json.load(f)
         except: pass
-    return {
-        "is_setup": False,
-        "study": {},
-        "game": {},
-        "music": {},
-        "timers": {
-            "study_break_sec": 2 * 3600,
-            "game_limit_sec": int(2.5 * 3600),
-        },
-    }
+    return {"is_setup": False, "study": {}, "game": {}, "music": {}}
 
 def atomic_save(file_path, data):
     """原子化写入：增加自动补全目录功能"""
@@ -502,11 +456,11 @@ class SetupWizard(ctk.CTkToplevel):
                                         fg_color="#10b981", hover_color="#059669", height=50, command=self.finish_setup)
         self.btn_deploy.pack(pady=20, fill="x", padx=25)
 
-        # 👇 拖拽：优先使用 tkinterdnd2（更稳）；不可用则仅支持“点击添加”
-        _bind_tkdnd_drop(self, self._on_files_dropped)
-
-    def _on_files_dropped(self, paths):
-        self.handle_drop(paths)
+        # 👇 核心黑科技：向 Windows 底层注入全局拖拽监听钩子
+        try:
+            windnd.hook_dropfiles(self, func=self.handle_drop)
+        except Exception as e:
+            print(f"拖拽引擎注入失败: {e}")
 
     def build_section(self, title, key, color):
         frame = ctk.CTkFrame(self.scroll, fg_color="#18181b", corner_radius=8)
@@ -665,11 +619,7 @@ class SettingsPanel(ctk.CTkToplevel):
             "study": dict((initial_cfg or {}).get("study") or {}),
             "game": dict((initial_cfg or {}).get("game") or {}),
             "music": dict((initial_cfg or {}).get("music") or {}),
-            "timers": dict((initial_cfg or {}).get("timers") or {}),
         }
-        self.cfg.setdefault("timers", {})
-        self.cfg["timers"].setdefault("study_break_sec", 2 * 3600)
-        self.cfg["timers"].setdefault("game_limit_sec", int(2.5 * 3600))
 
         ctk.CTkLabel(
             self,
@@ -683,12 +633,6 @@ class SettingsPanel(ctk.CTkToplevel):
             font=("Consolas", 12),
             text_color="#10b981",
         ).pack(pady=(0, 12))
-        ctk.CTkLabel(
-            self,
-            text="支持拖拽：将 .exe 直接拖入此窗口即可自动添加（在当前标签页归类）",
-            font=("Consolas", 11),
-            text_color="#71717a",
-        ).pack(pady=(0, 10))
 
         self.tabview = ctk.CTkTabview(
             self,
@@ -703,13 +647,11 @@ class SettingsPanel(ctk.CTkToplevel):
             "study": self.tabview.add("STUDIO / 学习"),
             "game": self.tabview.add("GAMING / 游戏"),
             "music": self.tabview.add("MUSIC / 音乐"),
-            "timers": self.tabview.add("TIMERS / 时长"),
         }
 
         self.list_frames = {}
         for key in ["study", "game", "music"]:
             self._build_tab(key)
-        self._build_timers_tab()
 
         bottom = ctk.CTkFrame(self, fg_color="transparent")
         bottom.pack(fill="x", padx=18, pady=(0, 16))
@@ -723,93 +665,6 @@ class SettingsPanel(ctk.CTkToplevel):
             font=("Consolas", 14, "bold"),
             command=self._save,
         ).pack(side="right")
-
-        # 拖拽：优先使用 tkinterdnd2（更稳）；不可用则仅支持“点击添加”
-        _bind_tkdnd_drop(self, self._on_files_dropped)
-
-    def _on_files_dropped(self, paths):
-        # 与旧回调保持一致：逐个路径进入处理逻辑
-        for p in (paths or []):
-            try:
-                self._handle_dropped_path(str(p))
-            except Exception:
-                pass
-
-    def _decode_drop_path(self, f):
-        try:
-            if isinstance(f, bytes):
-                # Windows 常见为 gbk，也兼容 utf-8
-                try:
-                    return f.decode("gbk")
-                except Exception:
-                    return f.decode("utf-8", errors="ignore")
-            return str(f)
-        except Exception:
-            return ""
-
-    def _current_category_key(self):
-        try:
-            tab_name = self.tabview.get()  # e.g. "STUDIO / 学习"
-        except Exception:
-            tab_name = ""
-        name = (tab_name or "").upper()
-        if "STUDIO" in name:
-            return "study"
-        if "GAMING" in name or "GAME" in name:
-            return "game"
-        if "MUSIC" in name:
-            return "music"
-        return ""
-
-    def _handle_dropped_path(self, file_path: str):
-        low = (file_path or "").lower()
-        if low.endswith(".lnk"):
-            self._show_drop_error("❌ 拒绝快捷方式\n请拖入本体 .exe 文件！")
-            return
-        if not low.endswith(".exe"):
-            self._show_drop_error("❌ 格式错误\n仅支持拖入 .exe 程序！")
-            return
-
-        key = self._current_category_key()
-        if key in ["study", "game", "music"]:
-            exe_name = os.path.basename(file_path).lower()
-            self.cfg[key][exe_name] = file_path
-            self._render_list(key)
-            return
-
-        # 若当前不在三类标签页（比如 TIMERS），则询问归类
-        self._ask_drop_category(file_path)
-
-    def _ask_drop_category(self, file_path: str):
-        exe_name = os.path.basename(file_path).lower()
-        prompt = ctk.CTkToplevel(self)
-        prompt.title("分类确认")
-        prompt.geometry("380x200")
-        prompt.attributes("-topmost", True)
-        prompt.configure(fg_color="#18181b")
-
-        ctk.CTkLabel(prompt, text=f"📥 捕获实体: {exe_name}", font=("Consolas", 14, "bold"), text_color="#00f2ff").pack(pady=(25, 10))
-        ctk.CTkLabel(prompt, text="请指示该进程所属分类：", font=("Microsoft YaHei", 12), text_color="#a1a1aa").pack(pady=5)
-
-        btn_frame = ctk.CTkFrame(prompt, fg_color="transparent")
-        btn_frame.pack(pady=15)
-
-        def assign(k):
-            self.cfg[k][exe_name] = file_path
-            self._render_list(k)
-            prompt.destroy()
-
-        ctk.CTkButton(btn_frame, text="💻 STUDIO", width=90, fg_color="#082f49", hover_color="#0284c7", command=lambda: assign("study")).pack(side="left", padx=5)
-        ctk.CTkButton(btn_frame, text="🎮 GAMING", width=90, fg_color="#450a0a", hover_color="#dc2626", command=lambda: assign("game")).pack(side="left", padx=5)
-        ctk.CTkButton(btn_frame, text="🎵 MUSIC", width=90, fg_color="#78350f", hover_color="#d97706", command=lambda: assign("music")).pack(side="left", padx=5)
-
-    def _show_drop_error(self, msg: str):
-        win = ctk.CTkToplevel(self)
-        win.title("WARNING")
-        win.geometry("380x150")
-        win.attributes("-topmost", True)
-        win.configure(fg_color="#450a0a")
-        ctk.CTkLabel(win, text=msg, text_color="#fca5a5", font=("Microsoft YaHei", 11, "bold"), justify="center").pack(expand=True)
 
     def _build_tab(self, key):
         tab = self.tabs[key]
@@ -827,42 +682,6 @@ class SettingsPanel(ctk.CTkToplevel):
             command=lambda k=key: self._add_exe(k),
         ).pack(side="left")
 
-        # 快速输入：支持粘贴 exe 路径（拖拽在 CTk 上不稳定时作为替代）
-        self._quick_path_vars = getattr(self, "_quick_path_vars", {})
-        self._quick_path_vars.setdefault(key, tk.StringVar(value=""))
-        quick_entry = ctk.CTkEntry(
-            header,
-            width=320,
-            textvariable=self._quick_path_vars[key],
-            placeholder_text="在此粘贴 .exe 完整路径，然后回车添加",
-        )
-        quick_entry.pack(side="left", padx=(10, 6))
-        def _submit_quick(_evt=None, k=key):
-            p = (self._quick_path_vars[k].get() or "").strip().strip('"')
-            if p:
-                self._handle_dropped_path(p)  # 复用校验与归类逻辑
-                self._quick_path_vars[k].set("")
-        quick_entry.bind("<Return>", _submit_quick)
-
-        def _paste_quick(k=key):
-            try:
-                p = (self.clipboard_get() or "").strip().strip('"')
-            except Exception:
-                p = ""
-            if p:
-                self._quick_path_vars[k].set(p)
-                _submit_quick(k=k)
-
-        ctk.CTkButton(
-            header,
-            text="📋 粘贴添加",
-            width=90,
-            fg_color="#27272a",
-            hover_color="#3f3f46",
-            font=("Microsoft YaHei", 11, "bold"),
-            command=_paste_quick,
-        ).pack(side="left")
-
         ctk.CTkLabel(
             header,
             text="提示：点击条目可“替换路径”，右侧可删除",
@@ -875,86 +694,6 @@ class SettingsPanel(ctk.CTkToplevel):
         self.list_frames[key] = lst
 
         self._render_list(key)
-
-    def _sec_to_hm(self, sec: int):
-        try:
-            sec = int(sec or 0)
-        except Exception:
-            sec = 0
-        if sec < 0:
-            sec = 0
-        h = sec // 3600
-        m = (sec % 3600) // 60
-        return h, m
-
-    def _build_timers_tab(self):
-        tab = self.tabs["timers"]
-
-        wrap = ctk.CTkFrame(tab, fg_color="transparent")
-        wrap.pack(fill="both", expand=True, padx=16, pady=16)
-
-        ctk.CTkLabel(
-            wrap,
-            text="时长阈值（修改后立即生效）",
-            font=("Microsoft YaHei", 13, "bold"),
-            text_color="#e4e4e7",
-        ).pack(anchor="w", pady=(0, 10))
-
-        card = ctk.CTkFrame(wrap, fg_color="#18181b", corner_radius=10, border_width=1, border_color="#27272a")
-        card.pack(fill="x", pady=(0, 12))
-
-        # 学习休息提醒
-        study_sec = (self.cfg.get("timers") or {}).get("study_break_sec", 2 * 3600)
-        sh, sm = self._sec_to_hm(study_sec)
-
-        row1 = ctk.CTkFrame(card, fg_color="transparent")
-        row1.pack(fill="x", padx=14, pady=(14, 10))
-        ctk.CTkLabel(row1, text="学习提醒间隔", font=("Consolas", 12, "bold"), text_color="#00f2ff").pack(side="left")
-
-        self.study_h_var = tk.StringVar(value=str(sh))
-        self.study_m_var = tk.StringVar(value=str(sm))
-        ctk.CTkEntry(row1, width=70, textvariable=self.study_h_var).pack(side="right")
-        ctk.CTkLabel(row1, text="小时", font=("Microsoft YaHei", 11), text_color="#a1a1aa").pack(side="right", padx=(6, 12))
-        ctk.CTkEntry(row1, width=70, textvariable=self.study_m_var).pack(side="right")
-        ctk.CTkLabel(row1, text="分钟", font=("Microsoft YaHei", 11), text_color="#a1a1aa").pack(side="right", padx=(6, 12))
-
-        # 游戏防沉迷阈值
-        game_sec = (self.cfg.get("timers") or {}).get("game_limit_sec", int(2.5 * 3600))
-        gh, gm = self._sec_to_hm(game_sec)
-
-        row2 = ctk.CTkFrame(card, fg_color="transparent")
-        row2.pack(fill="x", padx=14, pady=(0, 14))
-        ctk.CTkLabel(row2, text="游戏弹窗阈值", font=("Consolas", 12, "bold"), text_color="#ef4444").pack(side="left")
-
-        self.game_h_var = tk.StringVar(value=str(gh))
-        self.game_m_var = tk.StringVar(value=str(gm))
-        ctk.CTkEntry(row2, width=70, textvariable=self.game_h_var).pack(side="right")
-        ctk.CTkLabel(row2, text="小时", font=("Microsoft YaHei", 11), text_color="#a1a1aa").pack(side="right", padx=(6, 12))
-        ctk.CTkEntry(row2, width=70, textvariable=self.game_m_var).pack(side="right")
-        ctk.CTkLabel(row2, text="分钟", font=("Microsoft YaHei", 11), text_color="#a1a1aa").pack(side="right", padx=(6, 12))
-
-        self.timers_err = ctk.CTkLabel(wrap, text="", font=("Microsoft YaHei", 11, "bold"), text_color="#ef4444")
-        self.timers_err.pack(anchor="w")
-
-        hint = (
-            "提示：分钟范围 0-59；可填 0 小时。\n"
-            "学习提醒：到达间隔时弹出休息提示。\n"
-            "游戏弹窗：到达阈值后触发全屏警告（并有 60 秒冷却）。"
-        )
-        ctk.CTkLabel(wrap, text=hint, font=("Consolas", 11), text_color="#71717a", justify="left").pack(anchor="w", pady=(8, 0))
-
-    def _parse_hm_to_sec(self, h_str: str, m_str: str):
-        h_str = (h_str or "").strip()
-        m_str = (m_str or "").strip()
-        if h_str == "":
-            h_str = "0"
-        if m_str == "":
-            m_str = "0"
-        h = int(h_str)
-        m = int(m_str)
-        if h < 0 or m < 0 or m > 59:
-            raise ValueError("invalid hm")
-        return h * 3600 + m * 60
 
     def _render_list(self, key):
         frame = self.list_frames[key]
@@ -1049,25 +788,6 @@ class SettingsPanel(ctk.CTkToplevel):
 
     def _save(self):
         try:
-            # Timers：先校验再保存，避免写入坏配置
-            if hasattr(self, "study_h_var") and hasattr(self, "game_h_var"):
-                try:
-                    study_sec = self._parse_hm_to_sec(self.study_h_var.get(), self.study_m_var.get())
-                    game_sec = self._parse_hm_to_sec(self.game_h_var.get(), self.game_m_var.get())
-                    if study_sec <= 0:
-                        raise ValueError("study interval must be > 0")
-                    if game_sec <= 0:
-                        raise ValueError("game limit must be > 0")
-                    self.cfg.setdefault("timers", {})
-                    self.cfg["timers"]["study_break_sec"] = int(study_sec)
-                    self.cfg["timers"]["game_limit_sec"] = int(game_sec)
-                    if hasattr(self, "timers_err") and self.timers_err.winfo_exists():
-                        self.timers_err.configure(text="")
-                except Exception:
-                    if hasattr(self, "timers_err") and self.timers_err.winfo_exists():
-                        self.timers_err.configure(text="⚠ 时长输入无效：请填整数，分钟 0-59，且总时长必须 > 0")
-                    return
-
             save_sys_config(self.cfg)
             if callable(self._on_save):
                 self._on_save(self.cfg)
@@ -1113,40 +833,13 @@ class FloatingTracker(ctk.CTk):
         
         # 窗口设定（保持隐藏状态下完成，避免闪烁）
         self.geometry("260x150+100+100") 
-        # 先用普通窗口确保能显示；稍后再切换为无边框（某些 Win11/驱动组合下，启动即无边框会“看不见”）
-        self.overrideredirect(False)
+        self.overrideredirect(True)      
         # 关键修复：`overrideredirect(True)` + `-toolwindow` 在部分 Windows 环境下会导致窗口“存在但不可见/不可切换”
-        # 注意：全窗 alpha 会在边缘产生混色“矩形黑框”（尤其是圆角裁剪后）
-        # 若你需要透明效果，建议改为仅内容控件视觉透明（或改用 transparentcolor 方案）
-        self.attributes("-topmost", True, "-alpha", 1.0)
+        self.attributes("-topmost", True, "-alpha", 0.92)
         ctk.set_appearance_mode("dark")
-        # 根窗口背景与主面板一致，避免圆角裁剪后出现“黑边/黑底”
-        try:
-            self.configure(fg_color="#111111")
-        except Exception:
-            pass
 
         # 配置完成，主窗口登场（在无边框/置顶属性设置之后）
         self.deiconify()
-
-        # 延迟切换为无边框，提升兼容性
-        def _enable_borderless():
-            try:
-                self.overrideredirect(True)
-                self.lift()
-                self.attributes("-topmost", True)
-                self.focus_force()
-                # 无边框后再做一次真实圆角裁剪（Win11 DWM 圆角对部分无边框窗不生效）
-                self.after(0, self._apply_windows_round_corners)
-            except Exception:
-                pass
-        self.after(80, _enable_borderless)
-
-        # Windows：初始化圆角（并在后续尺寸变化时重算 region）
-        self._round_radius = 14
-        self._round_job = None
-        self.bind("<Configure>", self._on_configure_apply_round, add="+")
-        self.after(0, self._apply_windows_round_corners)
 
         # 兜底：如果窗口被系统/其它置顶窗压到后台，强制拉回
         self.after(200, self._ensure_visible)
@@ -1173,35 +866,16 @@ class FloatingTracker(ctk.CTk):
         self.db = load_data()
         self.today = datetime.now().strftime("%Y-%m-%d")
         self.db = init_today_data(self.db, self.today)
-
-        # Timers（可配置）
-        timers = (self.sys_config or {}).get("timers") or {}
-        self.study_break_sec = int(timers.get("study_break_sec", 2 * 3600))
-        self.game_limit_sec = int(timers.get("game_limit_sec", int(2.5 * 3600)))
-        if self.study_break_sec <= 0:
-            self.study_break_sec = 2 * 3600
-        if self.game_limit_sec <= 0:
-            self.game_limit_sec = int(2.5 * 3600)
-
+        self.game_limit = int(2.5 * 3600)  
         self.quote_file = os.path.join(APP_DIR, "quotes.txt")
         self.current_quote = "Logic is the soul of every agent." # 默认金句
 
-        # 主框架（外层只负责圆角/背景；边框改为“内边框”避免溢出到圆角外）
-        self.main_frame = ctk.CTkFrame(self, corner_radius=12, fg_color="#111111", border_width=0)
-        self.main_frame.pack(fill="both", expand=True, padx=0, pady=0)
-
-        # 内边框层：真正的边框绘制发生在这里
-        self.inner_frame = ctk.CTkFrame(
-            self.main_frame,
-            corner_radius=12,
-            fg_color="#111111",
-            border_width=0,
-        )
-        # padx/pady=1 让边框在内侧“吃进去”，外沿保持纯圆角
-        self.inner_frame.pack(fill="both", expand=True, padx=0, pady=0)
+        # 主框架
+        self.main_frame = ctk.CTkFrame(self, corner_radius=12, fg_color="#111111", border_width=1, border_color="#27272a")
+        self.main_frame.pack(fill="both", expand=True, padx=1, pady=1)
         
         # --- 第一行：状态指示 ---
-        self.top_row = ctk.CTkFrame(self.inner_frame, fg_color="transparent")
+        self.top_row = ctk.CTkFrame(self.main_frame, fg_color="transparent")
         self.top_row.pack(side="top", fill="x", padx=10, pady=(8, 2))
         
         # 学习模式初始色应为赛博蓝（避免启动时“Study 变绿”）
@@ -1211,7 +885,7 @@ class FloatingTracker(ctk.CTk):
         self.lbl_time = ctk.CTkLabel(self.top_row, text="00:00:00", font=("Consolas", 22, "bold"), text_color="#00f2ff")
         self.lbl_time.pack(side="left", padx=15)
         # 👇 修复：纠正父级容器为 main_frame，收缩折行宽度至 240，修改引力为居中填充
-        self.lbl_quote = ctk.CTkLabel(self.inner_frame, text="正在同步思维矩阵...", 
+        self.lbl_quote = ctk.CTkLabel(self.main_frame, text="正在同步思维矩阵...", 
                                       font=("Microsoft YaHei", 12, "italic"), text_color="#a1a1aa", 
                                       wraplength=240, cursor="hand2") 
         self.lbl_quote.pack(side="top", expand=True, fill="both", pady=(2, 2))
@@ -1222,7 +896,7 @@ class FloatingTracker(ctk.CTk):
         # 绑定鼠标左键点击事件 (<Button-1>)
         self.lbl_quote.bind("<Button-1>", lambda e: self.refresh_quote())
 # 👇 ========= 在这里插入 ENV 标签 ========= 👇
-        self.lbl_env = ctk.CTkLabel(self.inner_frame, text="ENV SCAN: INITIALIZING SYSTEM...", 
+        self.lbl_env = ctk.CTkLabel(self.main_frame, text="ENV SCAN: INITIALIZING SYSTEM...", 
                                     font=("Consolas", 10, "bold"), text_color="#00f2ff")
         self.lbl_env.pack(side="bottom", pady=(0, 2))
         # 👆 ===================================== 👆
@@ -1250,7 +924,7 @@ class FloatingTracker(ctk.CTk):
         ToolTip(self.btn_settings, "Settings")
 
         # --- 第二行：快捷工具栏 ---
-        self.bot_row = ctk.CTkFrame(self.inner_frame, fg_color="transparent")
+        self.bot_row = ctk.CTkFrame(self.main_frame, fg_color="transparent")
         self.bot_row.pack(side="bottom", fill="x", padx=10, pady=(2, 5))
 
         # 天气显示应在小图标栏上方
@@ -1309,49 +983,20 @@ class FloatingTracker(ctk.CTk):
         ToolTip(self.btn_note, "奇思妙想")
 
         # 事件绑定
-        # 拖动绑定放在内层（边框/内容区域）更符合直觉
-        self.inner_frame.bind("<ButtonPress-1>", self.start_move)
-        self.inner_frame.bind("<B1-Motion>", self.do_move)
+        self.main_frame.bind("<ButtonPress-1>", self.start_move)
+        self.main_frame.bind("<B1-Motion>", self.do_move)
         
         self.warning_active = False         
         self.last_warning_time = 0  # 建议顺便加上这个，用于留出 60 秒关闭时间
-        # 监控循环：不要用后台线程跑 psutil（Python 3.14 下可能触发 GIL 致命崩溃）
+        # 线程启动
         self.running = True
-        self._monitor_loop_counter = 0
-        self.after(1000, self._monitor_tick)
+        # 核心监控线程（原先未启动会导致学习/游戏/音乐时长都不增长）
+        threading.Thread(target=self.monitor_loop, daemon=True).start()
         threading.Thread(target=self.fetch_daily_quote, daemon=True).start()
         self.update_ui()
         self.after(1500, self.check_sleep_log) 
         # 👇 新增这一行，启动天气定位引擎 👇
         self.fetch_env_data()
-
-    def _fetch_soup_text(self, kind: str = "game") -> str:
-        """联网获取鸡汤/金句（失败则返回空字符串，由调用方兜底）"""
-        try:
-            # hitokoto: https://v1.hitokoto.cn/
-            # c=k(哲学) c=d(文学) c=i(诗词) —— 尽量偏“提醒自律”方向
-            params = {"c": ["k", "d", "i"]}
-            resp = requests.get("https://v1.hitokoto.cn/", params=params, timeout=4)
-            if resp.status_code != 200:
-                return ""
-            data = resp.json() if resp.content else {}
-            quote = (data or {}).get("hitokoto") or ""
-            if not quote:
-                return ""
-            author = (data or {}).get("from_who") or (data or {}).get("from") or "System"
-            return f"{quote} —— {author}"
-        except Exception:
-            return ""
-
-    def _apply_center_geometry(self, win: tk.Toplevel, w: int, h: int):
-        try:
-            sw = win.winfo_screenwidth()
-            sh = win.winfo_screenheight()
-            x = int((sw - w) / 2)
-            y = int((sh - h) / 2)
-            win.geometry(f"{w}x{h}+{x}+{y}")
-        except Exception:
-            pass
 
     def open_settings(self):
         if hasattr(self, "settings_win") and self.settings_win and self.settings_win.winfo_exists():
@@ -1371,20 +1016,6 @@ class FloatingTracker(ctk.CTk):
             self.study_procs = list(study_cfg.keys())
             self.game_procs = list(game_cfg.keys())
             self.music_procs = list(music_cfg.keys())
-
-            timers = (self.sys_config or {}).get("timers") or {}
-            try:
-                self.study_break_sec = int(timers.get("study_break_sec", 2 * 3600))
-            except Exception:
-                self.study_break_sec = 2 * 3600
-            try:
-                self.game_limit_sec = int(timers.get("game_limit_sec", int(2.5 * 3600)))
-            except Exception:
-                self.game_limit_sec = int(2.5 * 3600)
-            if self.study_break_sec <= 0:
-                self.study_break_sec = 2 * 3600
-            if self.game_limit_sec <= 0:
-                self.game_limit_sec = int(2.5 * 3600)
 
         self.settings_win = SettingsPanel(self, self.sys_config, on_save=on_save)
     # 👇 把这两个函数加在 __init__ 的下方，和 __init__ 保持相同的缩进级别！
@@ -1572,25 +1203,11 @@ class FloatingTracker(ctk.CTk):
         if hasattr(self, 'lbl_env'): self.lbl_env.pack_forget()
 
         # 3. 窗口形态变换 (先改透明属性，再改尺寸)
-        # 使用 #000000 作为穿透色：部分 Windows 环境下能避免外围残留黑色方框
-        # 关键：开启 transparentcolor 时必须把 alpha 拉满，否则穿透色会被混合造成边缘毛边/残影
-        try:
-            self.attributes("-alpha", 1.0)
-        except Exception:
-            pass
-        self.attributes("-transparentcolor", "#000000")
-        self.configure(fg_color="#000000")
-        # 隐藏内边框层，避免透明模式下出现边缘杂色
-        try:
-            if hasattr(self, "inner_frame") and self.inner_frame.winfo_exists():
-                self.inner_frame.pack_forget()
-        except Exception:
-            pass
-
-        self.main_frame.configure(fg_color="#000000", border_width=0)
-        # 最小化：恢复最初的“胶囊脸型”设计 + 两只猫耳 + 眼睛
-        self.geometry("80x50")
-        self.update_idletasks()
+        # 使用 #000001 作为穿透色，实现真正的无边框圆角
+        self.attributes("-transparentcolor", "#000001")
+        self.configure(fg_color="#000001")
+        self.main_frame.configure(fg_color="#000001", border_width=0)
+        self.geometry("80x50") 
 
         # 4. 构建核心容器
         if hasattr(self, 'cat_container'):
@@ -1600,92 +1217,28 @@ class FloatingTracker(ctk.CTk):
         self.cat_container = ctk.CTkFrame(self.main_frame, fg_color="transparent")
         self.cat_container.pack(expand=True, fill="both")
 
-        # 5. 最小化模型（椭圆外框 + 耳朵 + 眼睛；背景透明）
-        self.cat_canvas = tk.Canvas(
-            self.cat_container,
-            width=80,
-            height=50,
-            bg="#000000",
-            highlightthickness=0,
-            bd=0,
-            relief="flat",
-        )
-        self.cat_canvas.pack(fill="both", expand=True)
+        # 5. 【核心主体】 - 一个圆润的深色底座
+        self.eye_orb = ctk.CTkFrame(self.cat_container, 
+                                   width=70, height=38, 
+                                   fg_color="#18181b", 
+                                   corner_radius=19, 
+                                   border_width=1, 
+                                   border_color="#3f3f46")
+        self.eye_orb.place(relx=0.5, rely=0.5, anchor="center")
 
-        # 6. 【核心修复】：使用 self.current_eye_color
+        # 6. 【核心修复】：将 STUDIO 改为 STUDY，并使用 self.current_eye_color
         self.current_eye_color = "#00f2ff" if self.mode == "STUDY" else "#ef4444"
-
-        head_fill = "#18181b"
-        border = "#3f3f46"
-        border_w = 1
-
-        # 耳朵（放大：更高更宽；内部黑色填充，贴合猫头上沿）
-        self.cat_canvas.create_polygon(
-            14, 15,
-            28, 0,
-            42, 15,
-            fill=head_fill,
-            outline=border,
-            width=border_w,
-            joinstyle="round",
-            smooth=True,
-            tags=("cat",),
-        )
-        self.cat_canvas.create_polygon(
-            38, 15,
-            52, 0,
-            66, 15,
-            fill=head_fill,
-            outline=border,
-            width=border_w,
-            joinstyle="round",
-            smooth=True,
-            tags=("cat",),
-        )
-
-        # 脸型（胶囊）：填充层不画 outline，避免中间拼接产生“白色线条”
-        # 再单独画一层连续边框（两段弧 + 两段直线），保证外框完整且无接缝
-        x0, y0, x1, y1 = 5, 10, 75, 48
-        r = 19
-        # fill-only layer
-        self.cat_canvas.create_oval(x0, y0, x0 + 2 * r, y1, fill=head_fill, outline="", tags=("cat_fill",))
-        self.cat_canvas.create_oval(x1 - 2 * r, y0, x1, y1, fill=head_fill, outline="", tags=("cat_fill",))
-        self.cat_canvas.create_rectangle(x0 + r, y0, x1 - r, y1, fill=head_fill, outline="", tags=("cat_fill",))
-        # border layer (continuous)
-        self.cat_canvas.create_arc(
-            x0, y0, x0 + 2 * r, y1,
-            start=90, extent=180,
-            style="arc",
-            outline=border,
-            width=border_w,
-            tags=("cat_border",),
-        )
-        self.cat_canvas.create_arc(
-            x1 - 2 * r, y0, x1, y1,
-            start=-90, extent=180,
-            style="arc",
-            outline=border,
-            width=border_w,
-            tags=("cat_border",),
-        )
-        self.cat_canvas.create_line(x0 + r, y0, x1 - r, y0, fill=border, width=border_w, tags=("cat_border",))
-        self.cat_canvas.create_line(x0 + r, y1, x1 - r, y1, fill=border, width=border_w, tags=("cat_border",))
-
-        # 眼睛（用 oval，方便眨眼时改高度）
-        self.eye_open_h = 10
-        self.eye_closed_h = 2
-        # 与旧版 relx=0.3/0.7 对齐（胶囊内部居中）
-        self.eye_base_y = 24
-        self.eye_l_id = self.cat_canvas.create_oval(21, self.eye_base_y, 31, self.eye_base_y + self.eye_open_h, fill=self.current_eye_color, outline="", tags=("eye_l",))
-        self.eye_r_id = self.cat_canvas.create_oval(49, self.eye_base_y, 59, self.eye_base_y + self.eye_open_h, fill=self.current_eye_color, outline="", tags=("eye_r",))
-
-        # 应用异形窗口区域（去除外围方框）
-        self.after(0, self._apply_collapsed_window_region)
+        
+        self.eye_l = ctk.CTkFrame(self.eye_orb, width=11, height=11, corner_radius=6, fg_color=self.current_eye_color)
+        self.eye_l.place(relx=0.3, rely=0.5, anchor="center")
+        self.eye_r = ctk.CTkFrame(self.eye_orb, width=11, height=11, corner_radius=6, fg_color=self.current_eye_color)
+        self.eye_r.place(relx=0.7, rely=0.5, anchor="center")
         # 7. 安全眨眼算法
         def safe_blink():
-            if self.is_collapsed and hasattr(self, "cat_canvas") and self.cat_canvas.winfo_exists():
+            if self.is_collapsed and hasattr(self, 'eye_l') and self.eye_l.winfo_exists():
                 try:
-                    self._set_canvas_eyes(opened=False)
+                    self.eye_l.configure(height=1)
+                    self.eye_r.configure(height=1)
                     # 150ms 后恢复睁眼
                     self.after(150, self.safe_open_eyes)
                     # 随机 3-7 秒眨一次
@@ -1695,15 +1248,16 @@ class FloatingTracker(ctk.CTk):
         self.blink_timer = self.after(3000, safe_blink)
         
         # 8. 绑定交互 (双击恢复，拖动移动)
-        for w in [self.cat_container, self.cat_canvas]:
+        for w in [self.cat_container, self.eye_orb, self.eye_l, self.eye_r]:
             w.bind("<Double-Button-1>", self.restore_window)
             w.bind("<ButtonPress-1>", self.start_move)
             w.bind("<B1-Motion>", self.do_move)
 
     def safe_open_eyes(self):
         """眨眼辅助：确保组件存在时才睁眼"""
-        if hasattr(self, "cat_canvas") and self.cat_canvas.winfo_exists():
-            self._set_canvas_eyes(opened=True)
+        if hasattr(self, 'eye_l') and self.eye_l.winfo_exists():
+            self.eye_l.configure(height=11)
+            self.eye_r.configure(height=11)
 
     def restore_window(self, event=None):
         """展开窗口：核心步骤是先清理计时器，防止卡死"""
@@ -1718,21 +1272,8 @@ class FloatingTracker(ctk.CTk):
             
         # 2. 还原透明度属性 (必须在 geometry 改变前执行)
         self.attributes("-transparentcolor", "") 
-        try:
-            self.attributes("-alpha", 0.92)
-        except Exception:
-            pass
         self.configure(fg_color="#111111")
-        self.main_frame.configure(fg_color="#111111", border_width=0, corner_radius=12)
-        # 恢复内边框层
-        try:
-            if hasattr(self, "inner_frame") and self.inner_frame.winfo_exists():
-                self.inner_frame.pack(fill="both", expand=True, padx=1, pady=1)
-        except Exception:
-            pass
-
-        # 清除异形窗口区域，恢复正常矩形窗口
-        self._clear_window_region()
+        self.main_frame.configure(fg_color="#111111", border_width=1, corner_radius=12)
 
         # 3. 物理销毁核心容器
         if hasattr(self, 'cat_container'):
@@ -1761,159 +1302,6 @@ class FloatingTracker(ctk.CTk):
         self.x = event.x; self.y = event.y
     def do_move(self, event):
         self.geometry(f"+{self.winfo_x() + (event.x - self.x)}+{self.winfo_y() + (event.y - self.y)}")
-
-    def _set_canvas_eyes(self, opened: bool):
-        try:
-            if not (hasattr(self, "cat_canvas") and self.cat_canvas.winfo_exists()):
-                return
-            h = self.eye_open_h if opened else self.eye_closed_h
-            # 固定 top=self.eye_base_y，调整 bottom 来模拟眨眼
-            y = getattr(self, "eye_base_y", 24)
-            self.cat_canvas.coords(self.eye_l_id, 21, y, 31, y + h)
-            self.cat_canvas.coords(self.eye_r_id, 49, y, 59, y + h)
-        except Exception:
-            pass
-
-    def _apply_collapsed_window_region(self):
-        """最小化形态：裁剪窗口区域为椭圆外框+猫耳，贴合 Canvas 绘制。"""
-        try:
-            if not self.is_collapsed:
-                return
-            self.update_idletasks()
-            hwnd = self.winfo_id()
-            if not hwnd:
-                return
-
-            gdi32 = ctypes.windll.gdi32
-            user32 = ctypes.windll.user32
-
-            # 脸型：round-rect（与 Canvas 的胶囊边界一致）
-            head = gdi32.CreateRoundRectRgn(5, 10, 75, 48, 38, 38)
-
-            # 耳朵：两个三角形 polygon（与 Canvas 点位一致；放大后的点位）
-            POINT = ctypes.wintypes.POINT
-            left_pts = (POINT * 3)(POINT(14, 15), POINT(28, 0), POINT(42, 15))
-            right_pts = (POINT * 3)(POINT(38, 15), POINT(52, 0), POINT(66, 15))
-            WINDING = 2
-            ear_l = gdi32.CreatePolygonRgn(left_pts, 3, WINDING)
-            ear_r = gdi32.CreatePolygonRgn(right_pts, 3, WINDING)
-
-            # 合并区域：head OR ears
-            combined = gdi32.CreateRectRgn(0, 0, 0, 0)
-            RGN_OR = 2
-            gdi32.CombineRgn(combined, head, ear_l, RGN_OR)
-            gdi32.CombineRgn(combined, combined, ear_r, RGN_OR)
-
-            # 应用区域（系统接管 combined）
-            user32.SetWindowRgn(hwnd, combined, True)
-
-            # 清理中间对象（combined 交给系统，其他可释放）
-            gdi32.DeleteObject(head)
-            gdi32.DeleteObject(ear_l)
-            gdi32.DeleteObject(ear_r)
-        except Exception:
-            pass
-
-    def _clear_window_region(self):
-        """恢复默认窗口区域（矩形）。"""
-        try:
-            hwnd = self.winfo_id()
-            if not hwnd:
-                return
-            ctypes.windll.user32.SetWindowRgn(hwnd, 0, True)
-        except Exception:
-            pass
-
-    def _apply_windows_round_corners(self):
-        """在 Windows 上启用圆角：优先 DWM，其次用 Window Region 做真实裁剪（无边框更可靠）。"""
-        try:
-            hwnd = self.winfo_id()
-            if not hwnd:
-                return
-
-            # https://learn.microsoft.com/windows/win32/api/dwmapi/nf-dwmapi-dwmsetwindowattribute
-            DWMWA_WINDOW_CORNER_PREFERENCE = 33
-            DWMCP_ROUND = 2
-
-            dwmapi = ctypes.windll.dwmapi
-            pref = ctypes.c_int(DWMCP_ROUND)
-            dwmapi.DwmSetWindowAttribute(
-                ctypes.wintypes.HWND(hwnd),
-                ctypes.wintypes.DWORD(DWMWA_WINDOW_CORNER_PREFERENCE),
-                ctypes.byref(pref),
-                ctypes.sizeof(pref),
-            )
-        except Exception:
-            # 兼容旧系统/无 DWM 环境，静默失败即可
-            pass
-
-        # 尝试禁用 DWM 非客户区渲染（常见于“无边框仍带矩形阴影/边框”的情况）
-        try:
-            hwnd = self.winfo_id()
-            if hwnd:
-                DWMWA_NCRENDERING_POLICY = 2
-                DWMNCRP_DISABLED = 1
-                policy = ctypes.c_int(DWMNCRP_DISABLED)
-                ctypes.windll.dwmapi.DwmSetWindowAttribute(
-                    ctypes.wintypes.HWND(hwnd),
-                    ctypes.wintypes.DWORD(DWMWA_NCRENDERING_POLICY),
-                    ctypes.byref(policy),
-                    ctypes.sizeof(policy),
-                )
-        except Exception:
-            pass
-
-        # 兜底：对 overrideredirect(True) 的无边框窗，用 region 做真实圆角裁剪
-        try:
-            self.update_idletasks()
-            self._apply_round_region(self._round_radius)
-        except Exception:
-            pass
-
-    def _on_configure_apply_round(self, _event=None):
-        """窗口大小/布局变化时，节流重算圆角 region（避免频繁 GDI 调用）。"""
-        if os.name != "nt":
-            return
-        try:
-            if self._round_job is not None:
-                self.after_cancel(self._round_job)
-            self._round_job = self.after(16, lambda: self._apply_round_region(self._round_radius))
-        except Exception:
-            pass
-
-    def _apply_round_region(self, radius: int):
-        """使用 SetWindowRgn 对窗口做真实圆角裁剪（适用于无边框）。"""
-        if os.name != "nt":
-            return
-        try:
-            hwnd = self.winfo_id()
-            if not hwnd:
-                return
-
-            w = int(self.winfo_width())
-            h = int(self.winfo_height())
-            if w <= 0 or h <= 0:
-                return
-
-            r = max(0, int(radius))
-            r = min(r, w // 2, h // 2)
-
-            gdi32 = ctypes.windll.gdi32
-            user32 = ctypes.windll.user32
-            # 轻微内缩 1px，减少半透明窗口导致的外沿黑线/矩形边
-            inset = 1 if (w > 4 and h > 4) else 0
-            hrgn = gdi32.CreateRoundRectRgn(
-                inset,
-                inset,
-                max(inset + 1, w - inset),
-                max(inset + 1, h - inset),
-                max(0, (r - inset) * 2),
-                max(0, (r - inset) * 2),
-            )
-            if hrgn:
-                user32.SetWindowRgn(hwnd, hrgn, True)
-        except Exception:
-            pass
 
     # --- 🧠 算力监控核心引擎 (严格防作弊模式) ---
     def monitor_loop(self):
@@ -1987,7 +1375,7 @@ class FloatingTracker(ctk.CTk):
                     # 如果判定在学习，累加总时间
                     if is_study:
                         self.db[self.today]["study_total"] += 1
-                        if self.study_break_sec > 0 and (self.db[self.today]["study_total"] % self.study_break_sec == 0):
+                        if self.db[self.today]["study_total"] % 7200 == 0: # 每 2 小时提醒
                             self.after(0, self.trigger_study_break)
 
                 # ==========================================
@@ -2009,7 +1397,7 @@ class FloatingTracker(ctk.CTk):
                     # 如果判定在打游戏，累加总时间
                     if game_active:
                         self.db[self.today]["game_total"] += 1
-                        if self.game_limit_sec > 0 and self.db[self.today]["game_total"] >= self.game_limit_sec:
+                        if self.db[self.today]["game_total"] >= 9000: # 达到 2.5 小时防沉迷阈值
                             if not self.warning_active and (time.time() - self.last_warning_time > 60):
                                 self.after(0, self.trigger_game_warning)
 
@@ -2022,93 +1410,6 @@ class FloatingTracker(ctk.CTk):
             except Exception as e:
                 print(f"监测异常: {e}")
                 continue
-
-    def _monitor_tick(self):
-        """主线程定时监控：替代 monitor_loop 的后台线程版本。"""
-        if not getattr(self, "running", False):
-            return
-
-        try:
-            # 配置未就绪则延迟
-            if not hasattr(self, "study_procs") or not self.study_procs:
-                self.after(1000, self._monitor_tick)
-                return
-
-            user32 = ctypes.windll.user32
-            self._monitor_loop_counter = int(getattr(self, "_monitor_loop_counter", 0)) + 1
-            self.db["last_heartbeat"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-            # 抓取当前电脑上所有正在运行的进程名 (转小写)
-            active_procs = []
-            for p in psutil.process_iter(['name']):
-                try:
-                    if p.info['name']:
-                        active_procs.append(p.info['name'].lower())
-                except Exception:
-                    continue
-
-            # 1) 🎵 听歌统计
-            music_active = False
-            for m in getattr(self, "music_procs", []) or []:
-                if m in active_procs:
-                    music_active = True
-                    break
-            self.music_active = music_active
-            if music_active:
-                self.db[self.today]["music_total"] += 1
-
-            # 2) 💻 学习统计
-            if self.mode == "STUDY":
-                is_study = False
-                for s in getattr(self, "study_procs", []) or []:
-                    if s in active_procs:
-                        is_study = True
-                        if s not in self.db[self.today]["study_apps"]:
-                            self.db[self.today]["study_apps"][s] = 0
-                        self.db[self.today]["study_apps"][s] += 1
-
-                if not is_study:
-                    hwnd = user32.GetForegroundWindow()
-                    length = user32.GetWindowTextLengthW(hwnd)
-                    if length > 0:
-                        buff = ctypes.create_unicode_buffer(length + 1)
-                        user32.GetWindowTextW(hwnd, buff, length + 1)
-                        title = buff.value.lower()
-                        if "visual studio code" in title or "vscode" in title:
-                            self.db[self.today]["study_apps"]["vscode"] = self.db[self.today]["study_apps"].get("vscode", 0) + 1
-                            is_study = True
-                        elif "chrome" in title or "bilibili" in title or "哔哩哔哩" in title:
-                            is_study = True
-
-                if is_study:
-                    self.db[self.today]["study_total"] += 1
-                    if self.study_break_sec > 0 and (self.db[self.today]["study_total"] % self.study_break_sec == 0):
-                        self.trigger_study_break()
-
-            # 3) 🎮 游戏统计
-            elif self.mode == "GAME":
-                game_active = False
-                for game in getattr(self, "game_procs", []) or []:
-                    if game in active_procs:
-                        game_active = True
-                        if game not in self.db[self.today]["game_apps"]:
-                            self.db[self.today]["game_apps"][game] = 0
-                        self.db[self.today]["game_apps"][game] += 1
-                        break
-
-                if game_active:
-                    self.db[self.today]["game_total"] += 1
-                    if self.game_limit_sec > 0 and self.db[self.today]["game_total"] >= self.game_limit_sec:
-                        if not self.warning_active and (time.time() - self.last_warning_time > 60):
-                            self.trigger_game_warning()
-
-            # 4) 💾 自动存盘 (每 10 秒)
-            if self._monitor_loop_counter % 10 == 0:
-                save_data(self.db)
-        except Exception as e:
-            print(f"监测异常: {e}")
-        finally:
-            self.after(1000, self._monitor_tick)
     def update_ui(self):
         if not self.is_collapsed:
             # 1. 更新主专注/游戏时间
@@ -2535,18 +1836,14 @@ class FloatingTracker(ctk.CTk):
         ctk.CTkButton(win, text="听会歌，休息一下", command=win.destroy, fg_color="#10b981", hover_color="#059669").pack(pady=20)
 
     def trigger_game_warning(self):
-        """游戏提醒窗：更克制的置顶提示 + 联网鸡汤"""
+        """震撼弹窗修复版：修正了执行顺序"""
         if self.warning_active: return # 状态锁检查
         self.warning_active = True     # 立即上锁
             
-        # 1. 创建窗口（不再全屏：避免“太粗暴”）
+        # 1. 先创建窗口
         win = ctk.CTkToplevel(self)
-        win.title("SYSTEM OVERRIDE")
-        win.attributes("-topmost", True)
-        win.configure(fg_color="#0b0b10")
-        win.resizable(False, False)
-        win.overrideredirect(True)
-        self._apply_center_geometry(win, 720, 420)
+        win.attributes("-fullscreen", True, "-topmost", True)
+        win.configure(fg_color="#000000") 
 
         # 2. 定义关闭逻辑
         def on_acknowledge():
@@ -2554,126 +1851,44 @@ class FloatingTracker(ctk.CTk):
             self.last_warning_time = time.time() # 记录时间开始 60 秒冷却
             win.destroy()
 
-        # 3. UI 组件（卡片式警告 + 倒计时 + 鸡汤）
-        outer = ctk.CTkFrame(win, fg_color="#0b0b10", corner_radius=14, border_width=1, border_color="#27272a")
-        outer.pack(expand=True, fill="both", padx=14, pady=14)
-
-        top = ctk.CTkFrame(outer, fg_color="transparent")
-        top.pack(fill="x", padx=18, pady=(12, 0))
-
-        btn_close = ctk.CTkButton(
-            top,
-            text="✕",
-            width=28,
-            height=28,
-            fg_color="transparent",
-            hover_color="#27272a",
-            text_color="#a1a1aa",
-            font=("Consolas", 16, "bold"),
-            command=on_acknowledge,
-        )
-        btn_close.pack(side="right")
-        ToolTip(btn_close, "关闭（60秒冷却）")
-
-        line = ctk.CTkFrame(outer, fg_color="#ef4444", height=6, corner_radius=6)
-        line.pack(fill="x", padx=18, pady=(10, 0))
+        # 3. 布局 UI 组件
+        # 赛博警戒线
+        line = ctk.CTkFrame(win, fg_color="#ef4444", height=10, corner_radius=0)
+        line.pack(fill="x", pady=(150, 0))
 
         # 主标题
-        ctk.CTkLabel(
-            outer,
-            text="SYSTEM OVERRIDE",
-            font=("Impact", 62),
-            text_color="#ef4444",
-        ).pack(pady=(18, 4))
+        ctk.CTkLabel(win, text="SYSTEM OVERRIDE", 
+                     font=("Impact", 85), text_color="#ef4444").pack(pady=(50, 10))
         
-        try:
-            lim = int(getattr(self, "game_limit_sec", int(2.5 * 3600)))
-        except Exception:
-            lim = int(2.5 * 3600)
-        lim_h = lim / 3600.0
-        lim_txt = f"{lim_h:.1f} HOURS" if abs(lim_h - round(lim_h)) > 1e-9 else f"{int(lim_h)} HOURS"
+        ctk.CTkLabel(win, text="LIMIT REACHED: 2.5 HOURS EXCEEDED", 
+                     font=("Consolas", 28, "bold"), text_color="#ffffff").pack()
 
-        ctk.CTkLabel(
-            outer,
-            text=f"LIMIT REACHED: {lim_txt} EXCEEDED",
-            font=("Consolas", 18, "bold"),
-            text_color="#e4e4e7",
-        ).pack(pady=(0, 14))
-
-        body = ctk.CTkFrame(outer, fg_color="#111111", corner_radius=12, border_width=1, border_color="#27272a")
-        body.pack(fill="both", expand=True, padx=18, pady=(0, 14))
-
-        ctk.CTkLabel(
-            body,
-            text="建议：站起来走两分钟、喝口水、放松眼睛。",
-            font=("Microsoft YaHei", 14, "bold"),
-            text_color="#10b981",
-        ).pack(pady=(16, 8))
-
-        soup_lbl = ctk.CTkLabel(
-            body,
-            text="正在从网络获取鸡汤...",
-            font=("Microsoft YaHei", 14, "italic"),
-            text_color="#a1a1aa",
-            justify="center",
-            wraplength=640,
+        # 文案
+        text_content = (
+            "游戏里再高的段位，也填补不了你感受到的那种‘平淡的刺痛’。\n"
+            "不要在这个虚拟的副本里当一个逃避的 NPC 了。\n"
+            "Architecture requires sacrifice. SHUT DOWN THE CLIENT NOW."
         )
-        soup_lbl.pack(padx=18, pady=(0, 10))
+        ctk.CTkLabel(win, text=text_content, font=("Microsoft YaHei", 20, "italic"), 
+                     text_color="#a1a1aa", justify="center", wraplength=1000).pack(pady=40)
 
-        countdown_lbl = ctk.CTkLabel(
-            body,
-            text="此窗口可关闭（关闭后 60 秒冷却）",
-            font=("Consolas", 12, "bold"),
-            text_color="#71717a",
-        )
-        countdown_lbl.pack(pady=(0, 14))
+        # 4. 创建按钮 (这次它能找到 win 了)
+        btn_exit = ctk.CTkButton(win, text="执行退出协议 & 部署架构矩阵", 
+                                font=("Microsoft YaHei", 24, "bold"), 
+                                fg_color="#ef4444", hover_color="#b91c1c",
+                                width=450, height=70,
+                                command=on_acknowledge)
+        btn_exit.pack(pady=50)
 
-        btn_row = ctk.CTkFrame(outer, fg_color="transparent")
-        btn_row.pack(fill="x", padx=18, pady=(0, 10))
+        # 5. 启动闪烁动画
+        def flash():
+            if win.winfo_exists():
+                current_color = btn_exit.cget("fg_color")
+                next_color = "#991b1b" if current_color == "#ef4444" else "#ef4444"
+                btn_exit.configure(fg_color=next_color)
+                win.after(500, flash)
 
-        btn_ok = ctk.CTkButton(
-            btn_row,
-            text="我知道了（继续）",
-            font=("Microsoft YaHei", 14, "bold"),
-            fg_color="#27272a",
-            hover_color="#3f3f46",
-            height=40,
-            command=on_acknowledge,
-        )
-        btn_ok.pack(side="right")
-
-        # 轻量倒计时：可选自动关闭（不强制）
-        ttl_sec = 20
-        def tick():
-            nonlocal ttl_sec
-            if not win.winfo_exists():
-                return
-            ttl_sec -= 1
-            if ttl_sec <= 0:
-                on_acknowledge()
-                return
-            countdown_lbl.configure(text=f"可关闭 / 自动收起倒计时：{ttl_sec}s（关闭后 60 秒冷却）")
-            win.after(1000, tick)
-
-        win.after(1000, tick)
-
-        # 4. 联网鸡汤（后台线程拉取，UI 主线程更新）
-        def load_soup():
-            text = self._fetch_soup_text("game")
-            if not text:
-                # 兜底：复用本地缓存的 quotes 或默认句
-                fallback_text = "你不是缺时间，你是缺一个把自己拉回来的动作。"
-                try:
-                    with open(os.path.join(APP_DIR, "quotes.txt"), "r", encoding="utf-8") as f:
-                        cached = (f.read() or "").strip()
-                        if cached:
-                            fallback_text = cached
-                except Exception:
-                    pass
-                text = fallback_text
-            self.after(0, lambda: soup_lbl.configure(text=text))
-
-        threading.Thread(target=load_soup, daemon=True).start()
+        flash()
 if __name__ == "__main__":
     try:
         app = FloatingTracker()
