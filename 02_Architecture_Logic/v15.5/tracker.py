@@ -4,8 +4,6 @@ import json
 import ctypes
 import ctypes.wintypes
 import time
-import pystray
-from PIL import ImageDraw  # 用于在内存中凭空画出一个赛博图标
 import psutil
 import winreg
 import calendar
@@ -19,19 +17,6 @@ import glob
 import random
 from PIL import Image, ImageTk, ImageGrab
 import traceback
-
-# ==========================================
-# 📦 工业级资源寻路引擎 (兼容 PyInstaller 打包)
-# ==========================================
-def resource_path(relative_path):
-    """获取资源的绝对路径，完美兼容开发环境与 PyInstaller 单文件打包环境"""
-    try:
-        # PyInstaller 打包后，会将资源解压到一个名为 _MEIPASS 的临时目录
-        base_path = sys._MEIPASS
-    except Exception:
-        # 如果是在 VS Code 里直接运行代码，就用当前文件所在目录
-        base_path = os.path.dirname(os.path.abspath(__file__))
-    return os.path.join(base_path, relative_path)
 
 try:
     # optional dependency (pylance/pyright may not resolve in env)
@@ -69,6 +54,9 @@ APP_NAME = "ArchitectTerminal"
 # 获取 Windows 标准应用数据路径 (AppData/Roaming)
 # 这样即使安装在 C 盘，读写数据也永远拥有合法权限
 APPDATA_PATH = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), APP_NAME)
+# ==========================================
+# ⚙️ 核心路径矩阵 (V16.5 绝对防御版)
+# ==========================================
 def get_safe_path():
     try:
         # 优先获取 AppData，如果获取失败则退回到当前程序目录
@@ -107,40 +95,75 @@ for d in [APP_DIR, NOTES_DIR, IMAGE_DIR]:
             ctypes.windll.user32.MessageBoxW(0, f"权限初始化失败: {e}\n请尝试以管理员权限运行。", "系统错误", 0x10)
             sys.exit(1)
 
+# 👇 新增：系统配置文件路径与读写引擎
+CONFIG_FILE = os.path.join(APP_DIR, "system_config.json")
+
 def load_sys_config():
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
                 cfg = json.load(f)
-                if not isinstance(cfg, dict): cfg = {}
-                if "timers" not in cfg or not isinstance(cfg.get("timers"), dict): cfg["timers"] = {}
-                cfg["timers"].setdefault("study_break_sec", 2 * 3600)
-                cfg["timers"].setdefault("game_limit_sec", int(2.5 * 3600))
+                # 兼容旧版本：补齐缺失字段
+                if not isinstance(cfg, dict):
+                    cfg = {}
+                if "timers" not in cfg or not isinstance(cfg.get("timers"), dict):
+                    cfg["timers"] = {}
+                cfg["timers"].setdefault("study_break_sec", 2 * 3600)  # 默认：2小时
+                cfg["timers"].setdefault("game_limit_sec", int(2.5 * 3600))  # 默认：2.5小时
                 return cfg
         except: pass
-    return {"is_setup": False, "study": {}, "game": {}, "music": {}, "timers": {"study_break_sec": 2 * 3600, "game_limit_sec": int(2.5 * 3600)}}
+    return {
+        "is_setup": False,
+        "study": {},
+        "game": {},
+        "music": {},
+        "timers": {
+            "study_break_sec": 2 * 3600,
+            "game_limit_sec": int(2.5 * 3600),
+        },
+    }
 
 def atomic_save(file_path, data):
-    """原子化写入引擎"""
+    """原子化写入：增加自动补全目录功能"""
+    # 🚀 核心补丁：确保文件夹存在，否则保存必崩
     folder = os.path.dirname(file_path)
-    if not os.path.exists(folder): os.makedirs(folder, exist_ok=True)
+    if not os.path.exists(folder):
+        os.makedirs(folder, exist_ok=True)
+
     temp_file = file_path + ".tmp"
     try:
         with open(temp_file, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=4, ensure_ascii=False)
-        if os.path.exists(file_path): os.replace(temp_file, file_path)
-        else: os.rename(temp_file, file_path)
+        
+        if os.path.exists(file_path):
+            os.replace(temp_file, file_path)
+        else:
+            os.rename(temp_file, file_path)
     except Exception as e:
         if os.path.exists(temp_file): os.remove(temp_file)
         print(f"数据固化失败: {e}")
 
+# 重新链接函数
 def save_data(data): atomic_save(DATA_FILE, data)
 def save_sys_config(cfg): atomic_save(CONFIG_FILE, cfg)
+
+
+# 自动构建生态目录 (加入异常捕获)
+for d in [APP_DIR, NOTES_DIR, IMAGE_DIR]:
+    try:
+        os.makedirs(d, exist_ok=True)
+    except PermissionError:
+        ctypes.windll.user32.MessageBoxW(0, f"权限受阻！\n请不要在系统保护文件夹运行。\n报错路径: {d}", "系统权限错误", 0x10)
+        sys.exit(1)
 
 # 软件快捷启动路径
 NETEASE_MUSIC_PATH = r"E:\CloudMusic\cloudmusic.exe"
 WEGAME_PATH = r"F:\Program Files (x86)\WeGame\wegame.exe"
 
+# 进程监控特征码 (全小写)
+MUSIC_PROCESS_NAME = "cloudmusic.exe"
+GAME_NAMES = ["leagueclientuxrender.exe", "wegame.exe", "deltaforceclient-win64-shipping.exe"]
+STUDIO_TOOLS = ["cherrystudio.exe", "chatbox.exe", "anythingllm.exe"]
 # ==========================================
 # 0. 悬停提示引擎 (Tooltip)
 # ==========================================
@@ -191,6 +214,14 @@ def init_today_data(data, date_str):
     if "music_total" not in data[date_str]: data[date_str]["music_total"] = 0
     return data
 
+def get_diary_reflection():
+    try:
+        files = glob.glob("Processed_Diaries/*.md")
+        if not files: return "当下的逃避，会透支明天的念头通达。"
+        with open(random.choice(files), 'r', encoding='utf-8') as f:
+            content = [l.strip() for l in f.readlines() if len(l.strip()) > 15]
+        return f"“{random.choice(content)[:80]}...”" if content else "回归现实需要一个承诺。"
+    except: return "回归现实需要一个承诺。"
 
 # ==========================================
 # 📝 富文本架构师笔记引擎
@@ -553,16 +584,19 @@ class NoteWindow(ctk.CTkToplevel):
                 messagebox.showwarning("复制失败", f"昨天笔记为空：{y_day}", parent=self)
                 return
 
-            # 🚀 正确的复制日记逻辑
-            os.makedirs(os.path.dirname(today_path), exist_ok=True)
-            with open(today_path, "w", encoding="utf-8") as f:
-                f.write(y_content)
-
-            self.load_content(today)
-            self.save_content(show_feedback=True, feedback_text="✅ COPIED")
-            messagebox.showinfo("复制成功", f"已把 {y_day} 内容复制到 {today}", parent=self)
+            os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
+            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+                json.dump(self.cfg, f, indent=4, ensure_ascii=False)
+            
+            # 增加体验感弹窗
+            ok = ctk.CTkToplevel(self)
+            ok.geometry("320x120")
+            ok.attributes("-topmost", True)
+            ok.configure(fg_color="#111111")
+            ctk.CTkLabel(ok, text="✅ DEPLOYMENT SUCCESSFUL", font=("Consolas", 16, "bold"), text_color="#10b981").pack(expand=True)
+            self.after(1600, lambda: (ok.destroy(), self.destroy()))
         except Exception as e:
-            messagebox.showerror("复制失败", f"操作异常：{e}", parent=self)
+            self.show_error(f"❌ 部署失败: {e}")
 
     def delete_current_day_note(self):
         date_str = self._normalize_date_str(self.current_date)
@@ -1393,14 +1427,6 @@ class SettingsPanel(ctk.CTkToplevel):
 class FloatingTracker(ctk.CTk):
     def __init__(self):
         super().__init__()
-        # 🚀 注入主窗口和任务栏的星云图标
-        try:
-            self.iconbitmap(resource_path("app_icon.ico"))
-        except Exception as e:
-            print(f"图标加载失败: {e}")
-            
-        # 👇 调试用：运行后弹窗告诉你配置文件夹的绝对路径
-        print(f"--- 架构坐标: {CONFIG_FILE} ---")
         # 👇 调试用：运行后弹窗告诉你配置文件夹的绝对路径
         print(f"--- 架构坐标: {CONFIG_FILE} ---")
         # 甚至可以加一行代码直接自动打开这个文件夹
@@ -1538,6 +1564,9 @@ class FloatingTracker(ctk.CTk):
         
         # 绑定鼠标左键点击事件 (<Button-1>)
         self.lbl_quote.bind("<Button-1>", lambda e: self.refresh_quote())
+        
+        # 绑定鼠标左键点击事件 (<Button-1>)
+        self.lbl_quote.bind("<Button-1>", lambda e: self.refresh_quote())
 # 👇 ========= 在这里插入 ENV 标签 ========= 👇
         self.lbl_env = ctk.CTkLabel(self.inner_frame, text="ENV SCAN: INITIALIZING SYSTEM...", 
                                     font=("Consolas", 10, "bold"), text_color="#00f2ff")
@@ -1546,21 +1575,25 @@ class FloatingTracker(ctk.CTk):
         # 在 __init__ 的最后一行加上调用
         self.fetch_daily_quote()
 
-        # --- 🚀 重新排版的右上角控制台：[设置] [猫咪] [隐藏到托盘] ---
-        # 1. 隐藏到托盘 ✕ (修改为统一的低调灰)
-        self.btn_hide = ctk.CTkButton(self.top_row, text="✕", width=20, height=20, fg_color="transparent", 
-                                     hover_color="#27272a", text_color="#a1a1aa", font=("Consolas", 14, "bold"), 
-                                     command=self.hide_to_tray)
-        self.btn_hide.pack(side="right", padx=(0, 2))
-        ToolTip(self.btn_hide, "隐蔽驻留 (Hide to Tray)")
-
-        # 2. 缩小为猫咪 —
         self.btn_min = ctk.CTkButton(self.top_row, text="—", width=20, height=20, fg_color="transparent", 
-                                     hover_color="#27272a", text_color="#a1a1aa", font=("Consolas", 14, "bold"), 
-                                     command=self.toggle_collapse)
-        self.btn_min.pack(side="right", padx=(0, 2))
-        ToolTip(self.btn_min, "迷你形态 (Cat Mode)")
+                                     hover_color="#27272a", text_color="#a1a1aa", font=("Consolas", 14, "bold"), command=self.toggle_collapse)
+        self.btn_min.pack(side="right")
+        ToolTip(self.btn_min, "smaller")
 
+        # ⚙ 设置按钮：同音乐图标的字体/尺寸风格
+        self.btn_settings = ctk.CTkButton(
+            self.top_row,
+            text="⚙",
+            width=20,
+            height=20,
+            fg_color="transparent",
+            hover_color="#27272a",
+            text_color="#a1a1aa",
+            font=("Segoe UI Emoji", 12),
+            command=self.open_settings,
+        )
+        self.btn_settings.pack(side="right", padx=(0, 6))
+        ToolTip(self.btn_settings, "Settings")
 
         # --- 第二行：快捷工具栏 ---
         self.bot_row = ctk.CTkFrame(self.inner_frame, fg_color="transparent")
@@ -1637,8 +1670,7 @@ class FloatingTracker(ctk.CTk):
         self.after(1500, self.check_sleep_log) 
         # 👇 新增这一行，启动天气定位引擎 👇
         self.fetch_env_data()
-        # 👇 启动右下角托盘引擎
-        self.setup_tray()
+
     def _fetch_soup_text(self, kind: str = "game") -> str:
         """联网获取鸡汤/金句（失败则返回空字符串，由调用方兜底）"""
         try:
@@ -1701,56 +1733,6 @@ class FloatingTracker(ctk.CTk):
                 self.game_limit_sec = int(2.5 * 3600)
 
         self.settings_win = SettingsPanel(self, self.sys_config, on_save=on_save)
-    # ==========================================
-    # 🛸 隐形托盘矩阵 (System Tray Engine)
-    # ==========================================
-    def create_tray_icon(self):
-        """读取真实的 .ico 实体作为托盘图标"""
-        icon_path = resource_path("app_icon.ico")
-        if os.path.exists(icon_path):
-            return Image.open(icon_path)
-        else:
-            # 兜底方案：如果万一没找到图标，画个绿边黑框防崩溃
-            img = Image.new('RGB', (64, 64), color=(17, 17, 17))
-            draw = ImageDraw.Draw(img)
-            draw.rectangle((8, 8, 56, 56), outline=(0, 242, 255), width=4)
-            return img
-
-    def setup_tray(self):
-        """配置托盘右键菜单与双击事件"""
-        menu = pystray.Menu(
-            # default=True 代表双击托盘图标时触发这个动作
-            pystray.MenuItem('🖥️ 唤醒终端', self._tray_show, default=True),
-            pystray.MenuItem('⚙️ 系统设置', self._tray_settings),
-            pystray.MenuItem('❌ 彻底拔管 (退出)', self._tray_exit)
-        )
-        self.tray_icon = pystray.Icon("ArchitectTerminal", self.create_tray_icon(), "Starry Sky(运行中)", menu)
-        # 必须把托盘扔到后台线程去跑，否则会和 Tkinter 死锁
-        threading.Thread(target=self.tray_icon.run, daemon=True).start()
-
-    def hide_to_tray(self):
-        """点击右上角 ✕ 时调用：彻底隐藏主窗口"""
-        # 如果是猫咪状态，先还原，防止出现渲染 BUG
-        if self.is_collapsed:
-            self.restore_window()
-        self.withdraw()
-
-    def _tray_show(self, icon, item):
-        """托盘回调：必须通过 after 抛给主线程执行 UI 操作！"""
-        self.after(0, self._safe_deiconify)
-
-    def _safe_deiconify(self):
-        self.deiconify()
-        self.lift()
-        self.focus_force()
-
-    def _tray_settings(self, icon, item):
-        self.after(0, self.open_settings)
-
-    def _tray_exit(self, icon, item):
-        """安全拔管销毁一切进程"""
-        self.tray_icon.stop()
-        os._exit(0)
     # 👇 把这两个函数加在 __init__ 的下方，和 __init__ 保持相同的缩进级别！
 
     def fetch_env_data(self):
@@ -1851,176 +1833,52 @@ class FloatingTracker(ctk.CTk):
         except: pass
 
     def clean_memory(self):
-        """🚀 灭霸级内存释放引擎：精准猎杀高耗能进程"""
-        # 🔪 升级版猎杀名单 (涵盖高耗能浏览器、开发工具、办公软件)
-        target_list = [
-            # 浏览器家族 (最吃内存的怪物)
-            'chrome.exe', 'msedge.exe', 'firefox.exe', 'safari.exe', '360se.exe', 'sogouexplorer.exe',
-            # 开发与设计工具 (架构师专属)
-            'code.exe', 'idea64.exe', 'pycharm64.exe', 'java.exe', 'node.exe', 'navicat.exe', 'postman.exe',
-            # 办公与通讯软件
-            'wps.exe', 'winword.exe', 'excel.exe', 'powerpnt.exe', 'bilibili.exe', 'wechat.exe', 'qq.exe', 'dingtalk.exe'
-        ]
-        
+        target_list = ['chrome.exe', 'msedge.exe', 'bilibili.exe', 'wechat.exe', 'qq.exe', 'wps.exe', 'winword.exe', 'excel.exe']
         freed_mb = 0
-        killed_count = 0
-        
-        # 扫描系统所有进程
-        for proc in psutil.process_iter(['pid', 'name', 'memory_info']):
+        for proc in psutil.process_iter(['name', 'memory_info']):
             try:
-                p_name = proc.info['name']
-                if p_name and p_name.lower() in target_list:
-                    # ⚠️ 安全锁：绝对不要杀掉程序自己 (防止你调试时叫 python.exe)
-                    if proc.pid == os.getpid():
-                        continue
-                    
-                    # 累加即将释放的内存
+                if proc.info['name'] and proc.info['name'].lower() in target_list:
                     freed_mb += proc.info['memory_info'].rss / (1024 * 1024)
-                    
-                    # 从温柔的 terminate 升级为暴力的 kill，系统内核强制终止，绝不拖泥带水
-                    proc.kill() 
-                    killed_count += 1
-            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
-                # 遇到权限不够的系统级同名进程，优雅跳过
-                continue
+                    proc.terminate() 
+            except: pass
         
-        # ⚡ UX 视觉冲击反馈
         if freed_mb > 0:
-            # 爆出金色的释放数字
             self.lbl_mode_txt.configure(text=f"-{int(freed_mb)}MB!", font=("Impact", 16), text_color="#facc15")
-            print(f"🧹 猎杀完毕！共清理 {killed_count} 个进程，瞬间释放 {int(freed_mb)} MB 内存。")
         else:
             self.lbl_mode_txt.configure(text="Clean!", font=("Impact", 16), text_color="#10b981")
-        
-        # 2秒后，状态指示器自动冷却，恢复成暴躁的战斗红标志
-        self.after(2000, lambda: self.lbl_mode_txt.configure(text="GAME", font=("Impact", 20), text_color="#ef4444"))
+        self.after(2000, lambda: self.lbl_mode_txt.configure(text="Game", font=("Impact", 20), text_color="#ef4444"))   
 
     def switch_mode(self):
-        """核心协议：物理级重构界面主题，修复组件渲染坍塌"""
-        # 1. 切换内部状态
+        """模式切换：增加对眼睛颜色的即时控制与专属按钮显示"""
         if self.mode == "STUDY":
             self.mode = "GAME"
+            accent_color = "#ef4444" # 警告红
+            self.lbl_mode_txt.configure(text="Game", font=("Impact", 20), text_color=accent_color)
+            self.lbl_time.configure(text_color=accent_color)
+            
+            # 👇 核心修复：切到游戏模式时，显示清理内存按钮
+            if hasattr(self, 'btn_clean'):
+                self.btn_clean.pack(side="left", padx=5)
         else:
             self.mode = "STUDY"
-        
-        # 2. 清除所有常规的主界面组件 (让容器彻底干净)
-        for w in self.inner_frame.winfo_children():
-            w.pack_forget()
-
-        # 3. 🚀 仅恢复顶部栏的“容器”，绝对不要去碰它内部的子按钮！
-        self.top_row.pack(side="top", fill="x", padx=10, pady=(8, 2))
-
-        # 4. 如果之前有因为最小化产生的猫咪状态，直接解除
-        if getattr(self, "is_collapsed", False):
-            self.restore_window()
-
-        # 5. 调用核心重建引擎
-        if self.mode == "STUDY":
-            self._rebuild_study_interface()
-        elif self.mode == "GAME":
-            self._rebuild_gaming_interface()
-
-
-    # ==========================================
-    # 🔴 战斗终端：游戏主题重建引擎 (Thematic Redesign)
-    # ==========================================
-    def _rebuild_gaming_interface(self):
-        """激进大改：暴躁战斗红，遵守底部优先渲染法则"""
-        # 0. 强行修改主悬浮窗底色和标题文字颜色
-        try:
-            self.configure(fg_color="#0a0a0c") 
-            self.inner_frame.configure(fg_color="#0a0a0c")
-            self.lbl_mode_txt.configure(text="GAME", text_color="#ef4444")
-            self.lbl_time.configure(text_color="#ef4444")
-            self.current_eye_color = "#ef4444"
-        except Exception: pass
-
-        # 1. 🚀【核心修复】先 Pack 底部逃生舱！确保它沉在最底下不被挤出去！
-        self.bot_row.pack(side="bottom", fill="x", padx=10, pady=(2, 5))
-        
-        self.btn_switch.pack(side="left")
-        if hasattr(self, 'btn_clean'): 
-            self.btn_clean.pack(side="left", padx=5)
+            accent_color = "#00f2ff" # 赛博蓝
+            self.lbl_mode_txt.configure(text="Study", font=("Impact", 20), text_color=accent_color)
+            self.lbl_time.configure(text_color=accent_color)
             
-        self.music_container.pack_forget()
-        self.btn_data.pack_forget()
-        self.btn_note.pack_forget()
+            # 👇 核心修复：切回学习模式时，隐藏清理内存按钮
+            if hasattr(self, 'btn_clean'):
+                self.btn_clean.pack_forget()
 
-        # 2. 销毁旧的模式框，创建新的
-        if hasattr(self, 'mode_frame') and self.mode_frame.winfo_exists():
-            self.mode_frame.destroy()
-            
-        self.mode_frame = ctk.CTkFrame(self.inner_frame, fg_color="transparent")
-        # 中间的模式区要最后 Pack，让它自动填满“剩余”的中间空间
-        self.mode_frame.pack(side="top", fill="both", expand=True, padx=0, pady=0)
-        
-        # 3. 核心区：三个游戏启动按钮
-        btn_container = ctk.CTkFrame(self.mode_frame, fg_color="transparent")
-        btn_container.pack(expand=True, padx=10, pady=(5, 5))
+        # 如果已经最小化，瞬间改变眼睛颜色
+        if self.is_collapsed and hasattr(self, 'eye_l') and self.eye_l.winfo_exists():
+            self.eye_l.configure(fg_color=accent_color)
+            self.eye_r.configure(fg_color=accent_color)
+            self.current_eye_color = accent_color
+        #让天气标签也同步变色   
+        if hasattr(self, 'lbl_env') and self.lbl_env.winfo_exists():
+            self.lbl_env.configure(text_color=accent_color)
 
-        games = list(self.sys_config.get("game", {}).values())
-        if not games: games = ["#NO_GAME_CFG", "#NO_GAME_CFG", "#NO_GAME_CFG"]
-        elif len(games) < 3: games.extend(["#NO_GAME_CFG"] * (3 - len(games)))
-
-        def launch_game(path):
-            if path == "#NO_GAME_CFG": return
-            try: os.startfile(path)
-            except Exception: pass
-
-        btn_kwargs = {
-            "width": 50, "height": 50, 
-            "fg_color": "#18181b", 
-            "border_width": 2, "border_color": "#ef4444", 
-            "corner_radius": 10, 
-            "text_color": "#e4e4e7", 
-            "hover_color": "#450a0a",
-            "font": ("Consolas", 10, "bold")
-        }
-        
-        for g_path in games[:3]:
-            g_name = os.path.basename(g_path).replace(".exe", "").lower() if g_path != "#NO_GAME_CFG" else "[待配置]"
-            if len(g_name) > 8: g_name = g_name[:6] + ".."
-            btn = ctk.CTkButton(btn_container, text=f"🎮\n{g_name}", **btn_kwargs, command=lambda p=g_path: launch_game(p))
-            btn.pack(side="left", padx=5)
-
-
-    # ==========================================
-    # 🔵 沉浸终端：学习主题重建引擎 (Thematic Redesign)
-    # ==========================================
-    def _rebuild_study_interface(self):
-        """宁静大改：赛博禅修蓝，恢复经典的金句与极简模式"""
-        # 0. 强行恢复经典颜色
-        try:
-            self.configure(fg_color="#111111")
-            self.inner_frame.configure(fg_color="#111111")
-            self.lbl_mode_txt.configure(text="STUDY", text_color="#00f2ff")
-            self.lbl_time.configure(text_color="#00f2ff")
-            self.current_eye_color = "#00f2ff"
-        except Exception: pass
-
-        # 1. 优先 Pack 底部逃生舱
-        self.bot_row.pack(side="bottom", fill="x", padx=10, pady=(2, 5))
-        
-        # 隐藏游戏模式专属按钮
-        if hasattr(self, 'btn_clean'): self.btn_clean.pack_forget()
-        if hasattr(self, 'btn_wegame'): self.btn_wegame.pack_forget()
-        
-        # 恢复学习模式的四大金刚
-        self.btn_switch.pack(side="left")
-        self.music_container.pack(side="right", padx=(10, 5))
-        self.btn_data.pack(side="right", padx=1)
-        self.btn_note.pack(side="right", padx=1)
-
-        # 2. 恢复底部天气雷达
-        if hasattr(self, 'lbl_env'): self.lbl_env.pack(side="bottom", pady=(0, 2))
-
-        # 3. 🚀 核心修复：把每日金句请回来！铺满中间剩余的全部空间
-        if hasattr(self, 'lbl_quote'): 
-            self.lbl_quote.pack(side="top", expand=True, fill="both", pady=(2, 2))
-            
-        # 4. 🔪 彻底物理销毁那个带有“DEEP FOCUS TOOLS”的啰嗦列表
-        if hasattr(self, 'mode_frame') and self.mode_frame.winfo_exists():
-            self.mode_frame.destroy()
+        # 注意：`btn_note` 在 __init__ 里已创建并 pack；这里不要重复创建/pack，否则会越点越多
     def show_note_menu(self):
         if self.menu and self.menu.winfo_exists(): return
         self.menu = ctk.CTkToplevel(self)
@@ -2301,6 +2159,114 @@ class FloatingTracker(ctk.CTk):
                 user32.SetWindowRgn(hwnd, hrgn, True)
         except Exception:
             pass
+
+    # --- 🧠 算力监控核心引擎 (严格防作弊模式) ---
+    def monitor_loop(self):
+        """核心监测引擎：加入变量安全锁"""
+        user32 = ctypes.windll.user32
+        loop_counter = 0
+        
+        while self.running:
+            # 🚀 【核心修复3】：如果配置还没部署好，雷达保持静默，不往下执行
+            if not hasattr(self, 'study_procs') or not self.study_procs:
+                time.sleep(1)
+                continue
+                
+            try:
+                time.sleep(1) 
+                loop_counter += 1
+                self.db["last_heartbeat"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                
+                # 抓取当前电脑上所有正在运行的进程名 (转小写)
+                active_procs = []
+                for p in psutil.process_iter(['name']):
+                    try:
+                        if p.info['name']: 
+                            active_procs.append(p.info['name'].lower())
+                    except: 
+                        continue
+
+                # ==========================================
+                # 1. 🎵 听歌统计 (读取动态配置的音乐软件)
+                # ==========================================
+                music_active = False
+                for m in self.music_procs:
+                    if m in active_procs:
+                        music_active = True
+                        break
+                # 让 UI 可以决定是否显示“🎵 + 时长”
+                self.music_active = music_active
+                if music_active:
+                    self.db[self.today]["music_total"] += 1
+
+                # ==========================================
+                # 2. 💻 学习/架构模式统计
+                # ==========================================
+                if self.mode == "STUDY":
+                    is_study = False
+                    
+                    # 判定 A: 检查你配置的生产力软件是否在后台运行
+                    for s in self.study_procs:
+                        if s in active_procs:
+                            is_study = True
+                            # 记录单个软件的使用时长
+                            if s not in self.db[self.today]["study_apps"]:
+                                self.db[self.today]["study_apps"][s] = 0
+                            self.db[self.today]["study_apps"][s] += 1
+                    
+                    # 判定 B: 如果配置的工具没开，则检查前台活动窗口 (防止用浏览器查资料时漏计时)
+                    if not is_study:
+                        hwnd = user32.GetForegroundWindow()
+                        length = user32.GetWindowTextLengthW(hwnd)
+                        if length > 0:
+                            buff = ctypes.create_unicode_buffer(length + 1)
+                            user32.GetWindowTextW(hwnd, buff, length + 1)
+                            title = buff.value.lower()
+                            if "visual studio code" in title or "vscode" in title:
+                                # 兼容保底机制
+                                self.db[self.today]["study_apps"]["vscode"] = self.db[self.today]["study_apps"].get("vscode", 0) + 1
+                                is_study = True
+                            elif "chrome" in title or "bilibili" in title or "哔哩哔哩" in title:
+                                is_study = True
+                    
+                    # 如果判定在学习，累加总时间
+                    if is_study:
+                        self.db[self.today]["study_total"] += 1
+                        if self.study_break_sec > 0 and (self.db[self.today]["study_total"] % self.study_break_sec == 0):
+                            self.after(0, self.trigger_study_break)
+
+                # ==========================================
+                # 3. 🎮 游戏模式统计
+                # ==========================================
+                elif self.mode == "GAME":
+                    game_active = False
+                    
+                    # 遍历你动态配置的游戏软件
+                    for game in self.game_procs:
+                        if game in active_procs:
+                            game_active = True
+                            # 记录单个游戏的使用时长
+                            if game not in self.db[self.today]["game_apps"]: 
+                                self.db[self.today]["game_apps"][game] = 0
+                            self.db[self.today]["game_apps"][game] += 1
+                            break # 找到一个在运行的游戏，就跳出循环
+                    
+                    # 如果判定在打游戏，累加总时间
+                    if game_active:
+                        self.db[self.today]["game_total"] += 1
+                        if self.game_limit_sec > 0 and self.db[self.today]["game_total"] >= self.game_limit_sec:
+                            if not self.warning_active and (time.time() - self.last_warning_time > 60):
+                                self.after(0, self.trigger_game_warning)
+
+                # ==========================================
+                # 4. 💾 自动存盘 (每 10 秒)
+                # ==========================================
+                if loop_counter % 10 == 0:
+                    save_data(self.db)
+
+            except Exception as e:
+                print(f"监测异常: {e}")
+                continue
 
     def _monitor_tick(self):
         """主线程定时监控：替代 monitor_loop 的后台线程版本。"""
