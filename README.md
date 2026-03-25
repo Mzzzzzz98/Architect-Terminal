@@ -40,18 +40,11 @@
 
 ## 🛠️ 安装与运行 (Installation)
 
-### 方案 A：直接使用安装包 (推荐)
+###直接使用安装包 (推荐)
 1. 前往 [Releases](你的GitHub发布页面链接) 页面。
 2. 下载最新的 `Nebula_Setup_v1.0.0.exe`。
 3. 双击运行，跟随安装向导完成安装。
 
-### 方案 B：源码编译运行 (极客专属)
-如果你想从零开始掌控源码，请确保你的系统已安装 Python 3.10+。
-
-```bash
-# 1. 克隆星云终端矩阵
-git clone [https://github.com/你的用户名/Nebula-Terminal.git](https://github.com/你的用户名/Nebula-Terminal.git)
-cd Nebula-Terminal
 
 # 2. 安装底层依赖引擎
 pip install -r requirements.txt
